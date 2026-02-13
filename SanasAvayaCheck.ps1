@@ -6,11 +6,66 @@
 # Context : Logged-on user (HKCU access + GUI popups required)
 ##############################################################################
 
-# -------------------------
-# Log setup (create early)
-# -------------------------
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$audioCode = @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace SanasAudio
+{
+    [ComImport]
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        int NotImpl1();
+        int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppDevice);
+    }
+
+    [ComImport]
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        int Activate();
+        int OpenPropertyStore();
+        int GetId([MarshalAs(UnmanagedType.LPWStr)] out string ppstrId);
+    }
+
+    [ComImport]
+    [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorComObject
+    {
+    }
+
+    public static class AudioHelper
+    {
+        public static string GetDefault(int direction)
+        {
+            var enumerator = new MMDeviceEnumeratorComObject() as IMMDeviceEnumerator;
+            IMMDevice device;
+            Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(direction, 1, out device));
+            string id;
+            Marshal.ThrowExceptionForHR(device.GetId(out id));
+            return id;
+        }
+    }
+}
+"@
+
+Add-Type -TypeDefinition $audioCode -Language CSharp
+
+
+function Get-AudioDeviceFriendlyName($id) {
+    $reg = "HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\MMDEVAPI\$id"
+    return (Get-ItemProperty $reg).FriendlyName
+}
+
+# --- Log setup ---
 $LogFolder = "C:\ProgramData\CustomScripts"
-$LogPath   = Join-Path $LogFolder "SanasAvayaCheck.log"
+$LogPath   = "$LogFolder\SanasAvayaCheck.log"
 if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
 
 function Write-Log($msg) {
@@ -20,168 +75,113 @@ function Write-Log($msg) {
 
 Write-Log "=== Script execution started ==="
 
-try {
-    # Assemblies (GUI)
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+# --- Detect default audio devices (retry up to 5 times) ---
+$defaultMic     = ""
+$defaultSpeaker = ""
 
-    # -------------------------
-    # Audio default device helper
-    # -------------------------
-    Add-Type @'
-using System;
-using System.Runtime.InteropServices;
+for ($i = 1; $i -le 5; $i++) {
+    try {
+        $defaultSpeakerGuid = [SanasAudio.AudioHelper]::GetDefault(0)
+        $defaultSpeaker     = Get-AudioDeviceFriendlyName $defaultSpeakerGuid
+        $defaultMicGuid     = [SanasAudio.AudioHelper]::GetDefault(1)
+        $defaultMic         = Get-AudioDeviceFriendlyName $defaultMicGuid
 
-[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice {
-    int a(); int o();
-    int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        Write-Host "Found Sanas Mic $defaultMic Speaker $defaultSpeaker"
+    } catch {
+        Write-Log "Attempt $i - Error detecting audio devices: $($_.Exception.Message)"
+        Write-Host "Attempt $i - Error detecting audio devices: $($_.Exception.Message)"
+    }
+
+    if ($defaultMic -like "*Sanas*" -and $defaultSpeaker -like "*Sanas*") {
+        Write-Log "Sanas detected as default mic and speaker on attempt $i"
+        Write-Host "Sanas detected as default mic and speaker on attempt $i"
+        break
+    }
+    Start-Sleep -Seconds 3
 }
-[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator {
-    int f();
-    int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
-}
-[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
 
-public static class AudioHelper {
-    public static string GetDefault(int direction) {
-        var enumerator = new MMDeviceEnumeratorComObject() as IMMDeviceEnumerator;
-        IMMDevice dev = null;
-        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(direction, 1, out dev));
-        string id = null;
-        Marshal.ThrowExceptionForHR(dev.GetId(out id));
-        return id;
-    }
-}
-'@ -Name AudioNS -Namespace SanasAudio -ErrorAction SilentlyContinue
+Write-Log "Default Speaker    : $defaultSpeaker"
+Write-Log "Default Microphone : $defaultMic"
 
-    function Get-AudioDeviceFriendlyName($id) {
-        $reg = "HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\MMDEVAPI\$id"
-        try { return (Get-ItemProperty $reg -ErrorAction Stop).FriendlyName } catch { return "" }
-    }
+# --- Main logic ---
+if ($defaultMic -like "*Sanas*" -or $defaultSpeaker -like "*Sanas*") {
 
-    # -----------------------------------------
-    # Detect default audio devices (retry loop)
-    # -----------------------------------------
-    $defaultMic     = ""
-    $defaultSpeaker = ""
+    # Read current Avaya audio settings
+    $AvayaInputDevice  = (Get-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "ActiveRealRecordingDevice" -ErrorAction SilentlyContinue).ActiveRealRecordingDevice
+    $AvayaOutputDevice = (Get-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "ActivePlaybackDevice" -ErrorAction SilentlyContinue).ActivePlaybackDevice
 
-    for ($i = 1; $i -le 5; $i++) {
-        try {
-            $defaultSpeakerGuid = [SanasAudio.AudioHelper]::GetDefault(0)  # speakers
-            $defaultSpeaker     = Get-AudioDeviceFriendlyName $defaultSpeakerGuid
+    Write-Log "Avaya Input Device : $AvayaInputDevice"
+    Write-Log "Avaya Output Device: $AvayaOutputDevice"
 
-            $defaultMicGuid     = [SanasAudio.AudioHelper]::GetDefault(1)  # mic
-            $defaultMic         = Get-AudioDeviceFriendlyName $defaultMicGuid
-        }
-        catch {
-            Write-Log "Attempt $i - Error detecting audio devices: $($_.Exception.Message)"
-        }
+    Write-Host "Avaya Input Device : $AvayaInputDevice"
+    Write-Host "Avaya Output Device: $AvayaOutputDevice"
 
-        if ($defaultMic -like "*Sanas*" -and $defaultSpeaker -like "*Sanas*") {
-            Write-Log "Sanas detected as default mic and speaker on attempt $i"
-            break
-        }
-        Start-Sleep -Seconds 3
-    }
+    if ($AvayaInputDevice -notlike "*Sanas*") {
+        Write-Log "Avaya NOT using Sanas - updating registry and notifying user"
+        Write-Host "Avaya NOT using Sanas - updating registry and notifying user"
 
-    Write-Log "Default Speaker    : $defaultSpeaker"
-    Write-Log "Default Microphone : $defaultMic"
+        # Clear Avaya audio device registry entries so it picks up the system default (Sanas)
+        Set-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "ActiveRealRecordingDevice"   -Value ""
+        Set-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "PreferredWaveInDeviceName"   -Value ""
+        Set-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "ActivePlaybackDevice"        -Value ""
+        Set-ItemProperty -Path "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio" -Name "PreferredWaveOutDeviceName"  -Value ""
 
-    # -------------------------
-    # Main logic
-    # -------------------------
-    if ($defaultMic -like "*Sanas*" -or $defaultSpeaker -like "*Sanas*") {
+        Write-Log "Registry updated - cleared Avaya audio device entries"
 
-        # Guard: Avaya HKCU key may not exist until Avaya is launched/logged in
-        $avayaKey = "HKCU:\Software\AVAYA\Avaya one-X Agent\Audio"
-        if (-not (Test-Path $avayaKey)) {
-            Write-Log "Avaya HKCU audio registry path not found ($avayaKey). Avaya may not be initialized yet. Exiting."
-            Write-Log "=== Script execution completed ==="
-            exit 0
-        }
-
-        # Read current Avaya audio settings
-        $AvayaInputDevice  = (Get-ItemProperty -Path $avayaKey -Name "ActiveRealRecordingDevice" -ErrorAction SilentlyContinue).ActiveRealRecordingDevice
-        $AvayaOutputDevice = (Get-ItemProperty -Path $avayaKey -Name "ActivePlaybackDevice"      -ErrorAction SilentlyContinue).ActivePlaybackDevice
-
-        Write-Log "Avaya Input Device : $AvayaInputDevice"
-        Write-Log "Avaya Output Device: $AvayaOutputDevice"
-
-        if ($AvayaInputDevice -notlike "*Sanas*") {
-            Write-Log "Avaya NOT using Sanas — updating registry and notifying user"
-
-            # Clear Avaya audio device registry entries so it picks up the system default (Sanas)
-            Set-ItemProperty -Path $avayaKey -Name "ActiveRealRecordingDevice"  -Value "" -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $avayaKey -Name "PreferredWaveInDeviceName"  -Value "" -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $avayaKey -Name "ActivePlaybackDevice"       -Value "" -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path $avayaKey -Name "PreferredWaveOutDeviceName" -Value "" -ErrorAction SilentlyContinue
-
-            Write-Log "Registry updated — cleared Avaya audio device entries"
-
-            # Show notification to user
-            $form = New-Object System.Windows.Forms.Form
-            $form.TopMost         = $true
-            $form.StartPosition   = 'CenterScreen'
-            $form.FormBorderStyle = 'FixedDialog'
-            $form.Text            = "Sanas-Avaya Notification"
-            $form.Size            = New-Object System.Drawing.Size(420, 200)
-            $form.MaximizeBox     = $false
-            $form.MinimizeBox     = $false
-            $form.ShowInTaskbar   = $true
-
-            $label           = New-Object System.Windows.Forms.Label
-            $label.Text      = "Please re-launch Avaya to use Sanas"
-            $label.AutoSize  = $false
-            $label.Size      = New-Object System.Drawing.Size(380, 70)
-            $label.Location  = New-Object System.Drawing.Point(20, 25)
-            $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-            $label.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
-            $form.Controls.Add($label)
-
-            $okButton          = New-Object System.Windows.Forms.Button
-            $okButton.Text     = "Ok"
-            $okButton.Size     = New-Object System.Drawing.Size(90, 30)
-            $okButton.Location = New-Object System.Drawing.Point(160, 110)
-            $okButton.Add_Click({ $form.Close() })
-            $form.Controls.Add($okButton)
-
-            $form.ShowDialog() | Out-Null
-            Write-Log "User acknowledged the relaunch notification"
-        }
-        else {
-            Write-Log "Avaya is already using Sanas — no action needed"
-        }
-    }
-    else {
-        Write-Log "Sanas NOT detected as default device — alerting user"
-
-        $form         = New-Object System.Windows.Forms.Form
-        $form.TopMost = $true
+        # Show notification to user
+        $form = New-Object System.Windows.Forms.Form
+        $form.TopMost         = $true
         $form.StartPosition   = 'CenterScreen'
         $form.FormBorderStyle = 'FixedDialog'
-        $form.Text            = 'Sanas Not Detected'
+        $form.Text            = "Sanas-Avaya Notification"
+        $form.Size            = New-Object System.Drawing.Size(420, 200)
+        $form.MaximizeBox     = $false
+        $form.MinimizeBox     = $false
+        $form.ShowInTaskbar   = $true
 
-        [System.Windows.Forms.MessageBox]::Show(
-            $form,
-            "Sanas is not found as the default device.`nPlease launch Sanas.",
-            "Sanas Alert",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        ) | Out-Null
+        $label           = New-Object System.Windows.Forms.Label
+        $label.Text      = "Please re-launch Avaya to use Sanas"
+        $label.AutoSize  = $false
+        $label.Size      = New-Object System.Drawing.Size(380, 70)
+        $label.Location  = New-Object System.Drawing.Point(20, 25)
+        $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $label.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
+        $form.Controls.Add($label)
 
-        Write-Log "User alerted that Sanas is not detected"
+        $okButton          = New-Object System.Windows.Forms.Button
+        $okButton.Text     = "Ok"
+        $okButton.Size     = New-Object System.Drawing.Size(90, 30)
+        $okButton.Location = New-Object System.Drawing.Point(160, 110)
+        $okButton.Add_Click({ $form.Close() })
+        $form.Controls.Add($okButton)
+
+        $form.ShowDialog() | Out-Null
+        Write-Log "User acknowledged the relaunch notification"
     }
-
-    Write-Log "=== Script execution completed ==="
-    exit 0
+    else {
+        Write-Log "Avaya is already using Sanas - no action needed"
+        Write-Host "Avaya is already using Sanas - no action needed"
+    }
 }
-catch {
-    # Never let the scheduled task return 1 without logging
-    Write-Log "FATAL ERROR: $($_.Exception.Message)"
-    Write-Log "=== Script execution completed (with error) ==="
-    exit 0
+else {
+    Write-Host "Sanas NOT detected as default device - alerting user"
+    Write-Log "Sanas NOT detected as default device - alerting user"
+
+    $form         = New-Object System.Windows.Forms.Form
+    $form.TopMost = $true
+    $form.StartPosition   = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.Text            = 'Sanas Not Detected'
+
+    [System.Windows.Forms.MessageBox]::Show(
+        $form,
+        "Sanas is not found as the default device.`nPlease launch Sanas.",
+        "Sanas Alert",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+
+    Write-Log "User alerted that Sanas is not detected"
 }
 
-#EOF
+Write-Log "=== Script execution completed ==="
